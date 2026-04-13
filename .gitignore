@@ -45,5 +45,5 @@ MIMIR使用经验笔记.md
 # Keep source code and lightweight project files visible
 !src/
 !preprocessing/
-!PLAN.md
-!diagnose.py
+PLAN.md
+diagnose.py
