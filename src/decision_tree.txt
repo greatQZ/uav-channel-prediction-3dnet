@@ -1,0 +1,50 @@
+                 +--------------------------------------+
+                 | [START] Assess User Mobility/Scenario|
+                 +--------------------------------------+
+                                |
+           +--------------------+--------------------+--------------------+
+           | (Low-Speed/Static) |   (Medium-Speed)   |     (High-Speed)     |
+           V                    V                    V
++-----------------------+ +-----------------------+ +-----------------------+
+| T_coherence > 50ms    | | 5ms < T_coherence < 50ms| | T_coherence < 5ms     |
++-----------------------+ +-----------------------+ +-----------------------+
+           |                    |                    |
+           |                    |                    V
+           |                    |      +-------------------------------------------+
+           |                    |      | [Problem Analysis]                        |
+           |                    |      | T_coherence(e.g. 1.95ms) < T_delay(3-6ms) |
+           |                    |      | -> Channel has completely changed during delay |
+           |                    |      +-------------------------------------------+
+           |                    |                           |
+           |                    V                           V
+           |      +-----------------------------------------+-----------------------+
+           |      | [Problem Analysis]                      | [STRATEGY]            |
+           |      | T_delay(3-6ms) < T_coherence(e.g. 15ms) | Advanced / Indirect   |
+           |      | -> Channel has not fully decorrelated   | Prediction            |
+           |      +-----------------------------------------+-----------------------+
+           |                    |                           |
+           |                    V                           V
+           |      +---------------------------------------+  +---------------------------------------+
+           |      | [Problem Analysis]                    |  | Target: Predict CQI/SINR (not H)      |
+           |      | T_srs_period(10ms) ≈ T_coherence      |  | -> Predict slow-varying quality metrics |
+           |      | -> Sampling rate is adequate          |  +---------------------------------------+
+           |      +---------------------------------------+                   |
+           |                    |                                             V
+           |                    V                                     +---------------------------------------+
+           |      +-------------------+-----------------+             | Model: Physics-Informed Neural Net    |
+           |      | [STRATEGY]        | [Problem Analysis]|           | (PINN), Neural ODE, Reinforcement     |
+           |      | Standard          | T_delay << T_coherence |      | Learning, etc.                        |
+           |      | Prediction        | -> Delay impact is negligible |+---------------------------------------+
+           |      +-------------------+-----------------+
+           |                    |
+           V                    V
++-----------------------+  +-----------------------+
+| Target: Predict       |  | [STRATEGY]            |
+| Complex Channel H     |  | No Prediction         |
++-----------------------+  +-----------------------+
+           |                    |
+           V                    V
++-----------------------+  +-----------------------+
+| Model: LSTM/GRU       |  | -> Use "Hold-Last-Value"|
+| -> Classic time-series|  | -> Gain < Cost          |
++-----------------------+  +-----------------------+

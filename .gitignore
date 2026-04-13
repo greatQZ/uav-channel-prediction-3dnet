@@ -1,30 +1,49 @@
-# 忽略所有在 "data" 文件夹下的内容
-data/
-
-# 忽略所有在 "results" 文件夹下的内容
-results/
-
-src/
-# 也可以忽略特定类型的文件，无论它们在哪里
-# 例如，忽略所有的 .log 文件
-*.log
-
-# 忽略所有的 .tmp 或 .temp 文件
+# Runtime / generated
+__pycache__/
+*.pyc
+*.pyo
 *.tmp
 *.temp
+*.log
 
-# 忽略特定的配置文件（如果它包含敏感信息且不应共享）
-# config_secret.ini
-
-# 忽略 Python 的虚拟环境文件夹 (常见的例子)
+# Virtual environments
 venv/
 .venv/
 env/
-*.pyc
-__pycache__/
 
-# 忽略 IDE 或操作系统生成的文件
+# IDE / local workspace
 .vscode/
 .idea/
+.obsidian/
+.codex/
+.mimir/
 .DS_Store
 Thumbs.db
+
+# Git internals from nested copies
+src/.git/
+
+# Large / private / local-only project content
+data/
+results/
+archive/
+References/
+paper_latex/
+
+# Mimir / Memory Bank workflow artifacts (do not publish)
+mimir/
+mimir-ci/
+memory-bank/
+prompt_samples/
+docs/
+bin/
+scripts/
+.githooks/
+.gitmodules
+MIMIR使用经验笔记.md
+
+# Keep source code and lightweight project files visible
+!src/
+!preprocessing/
+!PLAN.md
+!diagnose.py
