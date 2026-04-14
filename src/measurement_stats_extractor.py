@@ -1,4 +1,5 @@
 import argparse
+import csv
 import json
 import math
 import re
@@ -6,6 +7,7 @@ from datetime import datetime, timezone
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import numpy as np
 
@@ -36,6 +38,167 @@ def to_utc_iso(ts_value: float) -> str:
     }
     ts_seconds = float(ts_value) * scale_map[unit]
     return datetime.fromtimestamp(ts_seconds, tz=timezone.utc).isoformat()
+
+
+def to_utc_datetime(ts_value: float) -> datetime:
+    unit = infer_unix_unit(ts_value)
+    scale_map = {
+        "s": 1.0,
+        "ms": 1e-3,
+        "us": 1e-6,
+        "ns": 1e-9,
+    }
+    ts_seconds = float(ts_value) * scale_map[unit]
+    return datetime.fromtimestamp(ts_seconds, tz=timezone.utc)
+
+
+def parse_local_datetime(value: str | None, tz_name: str) -> datetime | None:
+    if value is None:
+        return None
+    naive = datetime.fromisoformat(value)
+    return naive.replace(tzinfo=ZoneInfo(tz_name))
+
+
+@dataclass
+class GpsRecord:
+    timestamp_local: datetime
+    altitude_amsl_m: float
+    ground_speed_mps: float
+
+
+@dataclass
+class FlightSegment:
+    start_local: datetime
+    end_local: datetime
+    sample_count: int
+    rel_alt_mean_m: float
+    rel_alt_max_m: float
+    max_speed_mps: float
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "start_local": self.start_local.isoformat(),
+            "end_local": self.end_local.isoformat(),
+            "duration_sec": (self.end_local - self.start_local).total_seconds(),
+            "sample_count": self.sample_count,
+            "relative_altitude_mean_m": self.rel_alt_mean_m,
+            "relative_altitude_max_m": self.rel_alt_max_m,
+            "max_ground_speed_mps": self.max_speed_mps,
+        }
+
+
+def load_gps_records(gps_path: Path) -> list[GpsRecord]:
+    records: list[GpsRecord] = []
+    with gps_path.open(newline="", encoding="utf-8") as handle:
+        reader = csv.reader(handle)
+        next(reader, None)
+        for row in reader:
+            if len(row) < 14 or row[2] != "GPS":
+                continue
+            try:
+                ts = datetime.fromisoformat(row[1]).replace(tzinfo=None)
+                alt = float(row[12])
+                speed = float(row[13])
+            except (ValueError, IndexError):
+                continue
+            records.append(
+                GpsRecord(
+                    timestamp_local=ts,
+                    altitude_amsl_m=alt,
+                    ground_speed_mps=speed,
+                )
+            )
+    if not records:
+        raise ValueError(f"No valid GPS records found in {gps_path}")
+    return records
+
+
+def estimate_ground_baseline_altitude(
+    gps_records: list[GpsRecord],
+    baseline_minutes: float,
+    baseline_speed_max: float,
+) -> float:
+    first_ts = gps_records[0].timestamp_local
+    baseline_samples = [
+        rec.altitude_amsl_m
+        for rec in gps_records
+        if (rec.timestamp_local - first_ts).total_seconds() <= baseline_minutes * 60.0
+        and rec.ground_speed_mps <= baseline_speed_max
+    ]
+    if not baseline_samples:
+        baseline_samples = [rec.altitude_amsl_m for rec in gps_records[: min(100, len(gps_records))]]
+    return float(np.median(np.asarray(baseline_samples, dtype=np.float64)))
+
+
+def detect_flight_segments(
+    gps_records: list[GpsRecord],
+    baseline_altitude_amsl_m: float,
+    flight_threshold_alt_m: float,
+    flight_threshold_speed_mps: float,
+    min_flight_duration_sec: float,
+    merge_gap_sec: float,
+) -> list[FlightSegment]:
+    raw_segments: list[list[Any]] = []
+    active_start_idx: int | None = None
+    previous_active_ts: datetime | None = None
+
+    for idx, rec in enumerate(gps_records):
+        rel_alt = rec.altitude_amsl_m - baseline_altitude_amsl_m
+        is_active = rel_alt > flight_threshold_alt_m
+        if is_active and active_start_idx is None:
+            active_start_idx = idx
+        elif not is_active and active_start_idx is not None:
+            raw_segments.append([active_start_idx, idx - 1])
+            active_start_idx = None
+        if is_active:
+            previous_active_ts = rec.timestamp_local
+
+    if active_start_idx is not None:
+        raw_segments.append([active_start_idx, len(gps_records) - 1])
+
+    merged_segments: list[list[int]] = []
+    for start_idx, end_idx in raw_segments:
+        if not merged_segments:
+            merged_segments.append([start_idx, end_idx])
+            continue
+        gap = (
+            gps_records[start_idx].timestamp_local
+            - gps_records[merged_segments[-1][1]].timestamp_local
+        ).total_seconds()
+        if gap <= merge_gap_sec:
+            merged_segments[-1][1] = end_idx
+        else:
+            merged_segments.append([start_idx, end_idx])
+
+    flight_segments: list[FlightSegment] = []
+    for start_idx, end_idx in merged_segments:
+        segment_records = gps_records[start_idx : end_idx + 1]
+        duration_sec = (
+            segment_records[-1].timestamp_local - segment_records[0].timestamp_local
+        ).total_seconds()
+        if duration_sec < min_flight_duration_sec:
+            continue
+
+        rel_alts = np.asarray(
+            [rec.altitude_amsl_m - baseline_altitude_amsl_m for rec in segment_records],
+            dtype=np.float64,
+        )
+        speeds = np.asarray([rec.ground_speed_mps for rec in segment_records], dtype=np.float64)
+        if float(np.max(speeds)) < flight_threshold_speed_mps:
+            continue
+
+        flight_segments.append(
+            FlightSegment(
+                start_local=segment_records[0].timestamp_local,
+                end_local=segment_records[-1].timestamp_local,
+                sample_count=len(segment_records),
+                rel_alt_mean_m=float(np.mean(rel_alts)),
+                rel_alt_max_m=float(np.max(rel_alts)),
+                max_speed_mps=float(np.max(speeds)),
+            )
+        )
+
+    return flight_segments
 
 
 @dataclass
@@ -126,7 +289,11 @@ def process_channel_file(
     max_frames: int | None,
     progress_every: int,
     top_k: int,
+    start_local: datetime | None,
+    end_local: datetime | None,
+    local_timezone: str,
 ) -> dict[str, Any]:
+    local_tz = ZoneInfo(local_timezone)
     power_sum = np.zeros(num_subcarriers, dtype=np.float64)
     power_sq_sum = np.zeros(num_subcarriers, dtype=np.float64)
     seen_counts = np.zeros(num_subcarriers, dtype=np.int64)
@@ -141,6 +308,7 @@ def process_channel_file(
     accepted_frames = 0
     dropped_incomplete_frames = 0
     total_headers_seen = 0
+    dropped_outside_window = 0
 
     prev_frame = None
     current_frame = np.zeros(num_subcarriers, dtype=np.complex128)
@@ -152,11 +320,21 @@ def process_channel_file(
         nonlocal accepted_frames, dropped_incomplete_frames
         nonlocal first_timestamp_raw, last_timestamp_raw, prev_frame
         nonlocal current_frame, current_timestamp_raw, sc_count
+        nonlocal dropped_outside_window
 
         if current_timestamp_raw is None:
             return False
         if sc_count != num_subcarriers:
             dropped_incomplete_frames += 1
+            return False
+
+        frame_utc = to_utc_datetime(current_timestamp_raw)
+        frame_local = frame_utc.astimezone(local_tz)
+        if start_local is not None and frame_local < start_local:
+            dropped_outside_window += 1
+            return False
+        if end_local is not None and frame_local > end_local:
+            dropped_outside_window += 1
             return False
 
         frame_power = np.abs(current_frame) ** 2
@@ -204,9 +382,14 @@ def process_channel_file(
                     break
 
                 total_headers_seen += 1
+                next_timestamp_raw = float(header_match.group(2))
+                next_frame_local = to_utc_datetime(next_timestamp_raw).astimezone(local_tz)
+                if end_local is not None and next_frame_local > end_local and accepted_frames > 0:
+                    break
+
                 current_frame.fill(0.0)
                 current_frame_index = int(header_match.group(1))
-                current_timestamp_raw = float(header_match.group(2))
+                current_timestamp_raw = next_timestamp_raw
                 sc_count = 0
                 continue
 
@@ -244,12 +427,18 @@ def process_channel_file(
         "frames": {
             "accepted": accepted_frames,
             "dropped_incomplete": dropped_incomplete_frames,
+            "dropped_outside_window": dropped_outside_window,
             "headers_seen": total_headers_seen,
             "max_frames_limit": max_frames,
         },
         "time_range_utc": {
             "first": to_utc_iso(first_timestamp_raw) if first_timestamp_raw is not None else None,
             "last": to_utc_iso(last_timestamp_raw) if last_timestamp_raw is not None else None,
+        },
+        "window_filter_local": {
+            "timezone": local_timezone,
+            "start": start_local.isoformat() if start_local is not None else None,
+            "end": end_local.isoformat() if end_local is not None else None,
         },
         "subcarriers": {
             "configured_total": num_subcarriers,
@@ -329,11 +518,123 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=10,
         help="How many strongest subcarriers to include in the summary.",
     )
+    parser.add_argument(
+        "--start-local",
+        type=str,
+        default=None,
+        help="Optional local-time start filter, e.g. 2025-09-17T14:22:00",
+    )
+    parser.add_argument(
+        "--end-local",
+        type=str,
+        default=None,
+        help="Optional local-time end filter, e.g. 2025-09-17T14:29:00",
+    )
+    parser.add_argument(
+        "--local-timezone",
+        type=str,
+        default="Europe/Berlin",
+        help="Timezone used for start/end local-time filtering.",
+    )
+    parser.add_argument(
+        "--gps-log",
+        type=Path,
+        default=None,
+        help="Optional GPS log path used to auto-detect the flight window.",
+    )
+    parser.add_argument(
+        "--flight-segment-index",
+        type=int,
+        default=0,
+        help="Which detected flight segment to use when --gps-log is provided.",
+    )
+    parser.add_argument(
+        "--flight-threshold-alt-m",
+        type=float,
+        default=2.0,
+        help="Relative altitude threshold used to detect flight segments.",
+    )
+    parser.add_argument(
+        "--flight-threshold-speed-mps",
+        type=float,
+        default=1.0,
+        help="Minimum max ground speed required for a detected flight segment.",
+    )
+    parser.add_argument(
+        "--min-flight-duration-sec",
+        type=float,
+        default=10.0,
+        help="Minimum duration for a detected flight segment to be kept.",
+    )
+    parser.add_argument(
+        "--merge-gap-sec",
+        type=float,
+        default=1.0,
+        help="Merge detected altitude-active chunks separated by short gaps.",
+    )
+    parser.add_argument(
+        "--baseline-minutes",
+        type=float,
+        default=5.0,
+        help="Initial time span used to estimate ground altitude baseline from GPS.",
+    )
+    parser.add_argument(
+        "--baseline-speed-max-mps",
+        type=float,
+        default=1.0,
+        help="Only low-speed samples up to this limit are used for baseline altitude estimation.",
+    )
     return parser
 
 
 def main() -> None:
     args = build_arg_parser().parse_args()
+    start_local = parse_local_datetime(args.start_local, args.local_timezone)
+    end_local = parse_local_datetime(args.end_local, args.local_timezone)
+    flight_window_info = None
+
+    if args.gps_log is not None:
+        gps_path = args.gps_log.expanduser().resolve()
+        if not gps_path.exists():
+            raise FileNotFoundError(f"GPS log not found: {gps_path}")
+        gps_records = load_gps_records(gps_path)
+        baseline_alt = estimate_ground_baseline_altitude(
+            gps_records,
+            baseline_minutes=args.baseline_minutes,
+            baseline_speed_max=args.baseline_speed_max_mps,
+        )
+        detected_segments = detect_flight_segments(
+            gps_records=gps_records,
+            baseline_altitude_amsl_m=baseline_alt,
+            flight_threshold_alt_m=args.flight_threshold_alt_m,
+            flight_threshold_speed_mps=args.flight_threshold_speed_mps,
+            min_flight_duration_sec=args.min_flight_duration_sec,
+            merge_gap_sec=args.merge_gap_sec,
+        )
+        if not detected_segments:
+            raise ValueError("No valid flight segments detected from the provided GPS log.")
+        if args.flight_segment_index < 0 or args.flight_segment_index >= len(detected_segments):
+            raise IndexError(
+                f"flight_segment_index={args.flight_segment_index} is out of range for "
+                f"{len(detected_segments)} detected segments."
+            )
+        selected_segment = detected_segments[args.flight_segment_index]
+        if start_local is None:
+            start_local = selected_segment.start_local.replace(tzinfo=ZoneInfo(args.local_timezone))
+        if end_local is None:
+            end_local = selected_segment.end_local.replace(tzinfo=ZoneInfo(args.local_timezone))
+        flight_window_info = {
+            "gps_log": str(gps_path),
+            "ground_baseline_altitude_amsl_m": baseline_alt,
+            "selected_flight_segment_index": args.flight_segment_index,
+            "detected_segments": [seg.as_dict() for seg in detected_segments],
+        }
+        print(
+            "[flight-window] "
+            f"segment={args.flight_segment_index} "
+            f"start={selected_segment.start_local.isoformat()} "
+            f"end={selected_segment.end_local.isoformat()}"
+        )
 
     summaries = []
     for input_path in args.inputs:
@@ -347,6 +648,9 @@ def main() -> None:
             max_frames=args.max_frames,
             progress_every=args.progress_every,
             top_k=args.top_k_subcarriers,
+            start_local=start_local,
+            end_local=end_local,
+            local_timezone=args.local_timezone,
         )
         summaries.append(summary)
         print(
@@ -355,6 +659,8 @@ def main() -> None:
         )
 
     output = {"files": summaries}
+    if flight_window_info is not None:
+        output["flight_window_detection"] = flight_window_info
     if args.output_json is not None:
         output_path = args.output_json.expanduser().resolve()
         output_path.parent.mkdir(parents=True, exist_ok=True)
