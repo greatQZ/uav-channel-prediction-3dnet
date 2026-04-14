@@ -18,6 +18,9 @@ Route A measurement-first workflow.
   - BOLEK time-speed-power analysis for the standard-rate slices.
 - `data_analyse_time_speed_power_heatmap_speed_power_bolek_5ms.py`
   - BOLEK time-speed-power analysis for the 5 ms slices.
+- `synthetic_pretraining_dataset_builder.py`
+  - Minimal Route A interface that turns the backbone + residual pipeline into
+    windowed synthetic pretraining samples plus a manifest.
 
 ## Archived Local Files
 
